@@ -1,0 +1,5 @@
+node_modules/
+*.log
+results.jsonl
+bridge.config.json
+.DS_Store
