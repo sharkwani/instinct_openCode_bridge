@@ -1,6 +1,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const PROJECT_JSON = path.join(__dirname, '..', 'opencode.json');
@@ -9,7 +10,7 @@ const bridgeRepos = () => {
   try {
     return Object.values(require('../bridge.config.json').repos || {});
   } catch {
-    return ['/Users/srw/WebstormProjects/letAiChatWithEachOther/instinct-bridge'];
+    return [path.join(os.tmpdir(), 'instinct-bridge-test')];
   }
 };
 
