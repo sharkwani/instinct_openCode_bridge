@@ -3,11 +3,21 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const path = require('node:path');
 const sh = promisify(execFile);
-const git = async (cwd, ...a) => (await sh('git', a, { cwd })).stdout.trim();
+// Bound git children: an stuck git process (lock, prompt) must fail the
+// task, never wedge the shared serial queue (and every later task) forever.
+const GIT_TIMEOUT_MS = 60000;
+const git = async (cwd, ...a) => (await sh('git', a, { cwd, timeout: GIT_TIMEOUT_MS })).stdout.trim();
+exports.GIT_TIMEOUT_MS = GIT_TIMEOUT_MS;
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const express = require('express');
 const fs = require('node:fs');
 const PROTECTED = ['main', 'master'];
+const status = require('./status');
+
+// Map a task result status to the Instinct-facing terminal event.
+// done|needs_input -> done (work produced output); error|still_running -> failed.
+const terminalEvent = (s) => (s === 'done' || s === 'needs_input' ? 'done' : 'failed');
+exports.terminalEvent = terminalEvent;
 
 // Open a captured OpenCode session in the terminal (verified against
 // `opencode --help` v2.0.18: top-level --session/-s flag; there is no
@@ -27,7 +37,7 @@ exports.load = (cfg) => ({
 let tail = Promise.resolve();
 const serial = (fn) => { const res = tail.then(fn); tail = res.catch(() => {}); return res; };
 
-async function handle(cfg, executor, t) {
+async function handle(cfg, executor, t, statusSend) {
   const res = { id: t.id, status: 'error', branch: null, session_id: t.session_id || null, open_command: '', summary: '', diffstat: '', questions: [] };
   // Capture the submission-time session ID immediately so a later wait
   // timeout still reports where to look. Executor-created sessions are
@@ -42,6 +52,10 @@ async function handle(cfg, executor, t) {
     const branch = res.branch = `bridge/${String(t.id).replace(/[^A-Za-z0-9._-]/g, '-')}`;
     const exists = await git(cwd, 'branch', '--list', branch);
     await git(cwd, ...(exists ? ['switch', branch] : ['switch', '-c', branch]));
+    // Instinct: task is now executing. Non-blocking; carries the
+    // submission-time session when known (executor-created sessions are
+    // reported on done/failed). Never throws.
+    status.notify(statusSend, status.buildEvent('running', { id: t.id, sessionId: res.session_id }));
     try {
       const r = await executor.run({ task: t.task, cwd, sessionId: t.session_id, timeoutMs: (cfg.task_timeout_minutes || 30) * 60000 });
       res.session_id = r.sessionId || res.session_id; res.summary = r.summary; res.questions = r.questions || [];
@@ -56,7 +70,15 @@ async function handle(cfg, executor, t) {
       if (res.session_id) res.open_command = openCommand(res.session_id);
       const msg = String((e && e.message) || e);
       const exhausted = (e && e.code === 'STILL_RUNNING') || /still running remotely|opencode wait timeout/i.test(msg);
-      if (exhausted) {
+      // Delivery/stall diagnostics carry their own actionable summary
+      // (prompt never landed, or turn never started). Keep them as failures
+      // with the session preserved; never auto-approve or retry blindly.
+      const deliveryFault = e && (e.code === 'PROMPT_NOT_ACCEPTED' || e.code === 'STALLED_NO_PROGRESS');
+      if (deliveryFault) {
+        res.status = 'error';
+        res.summary = msg;
+        log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)', '-', res.summary);
+      } else if (exhausted) {
         res.status = 'still_running';
         // Clear, actionable summary: never a bare timeout. Always includes
         // the session ID and the exact open command when known.
@@ -79,7 +101,8 @@ async function handle(cfg, executor, t) {
 exports._handle = handle;
 
 exports.startHttp = (cfg) => {
-  const { executor } = exports.load(cfg);
+  const { executor, source } = exports.load(cfg);
+  const statusSend = source && typeof source.sendStatus === 'function' ? source.sendStatus.bind(source) : null;
   const resultsFile = path.join(__dirname, '..', 'results.jsonl');
   const results = new Map();
   if (fs.existsSync(resultsFile)) {
@@ -137,15 +160,18 @@ exports.startHttp = (cfg) => {
     results.set(t.id, { id: t.id, status: 'running' });
     log('accepted task', t.id, t.repo);
     res.json({ id: t.id, status: 'accepted' });
-    serial(() => handle(cfg, executor, t)).then((r) => {
+    status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
+    serial(() => handle(cfg, executor, t, statusSend)).then((r) => {
       results.set(r.id, r);
       log('task finished', r.id, r.status, 'session', r.session_id || '(none)', '| open:', r.open_command || '(no session captured)', r.summary ? String(r.summary).split('\n')[0].slice(0,120) : '');
       fs.appendFileSync(resultsFile, JSON.stringify(r) + '\n');
+      status.notify(statusSend, status.buildEvent(terminalEvent(r.status), { id: r.id, sessionId: r.session_id, branch: r.branch, detail: r.status, summary: r.status === 'done' || r.status === 'needs_input' ? r.summary : undefined, error: terminalEvent(r.status) === 'failed' ? r.summary : undefined }));
     }).catch((err) => {
       const failed = { id: t.id, status: 'error', branch: null, session_id: null, summary: String((err && err.message) || err), diffstat: '', questions: [] };
       results.set(t.id, failed);
       log('task crashed', t.id, failed.summary);
       try { fs.appendFileSync(resultsFile, JSON.stringify(failed) + '\n'); } catch {}
+      status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary }));
     });
   });
   app.get('/results/:id', (req, res) => {
@@ -156,6 +182,25 @@ exports.startHttp = (cfg) => {
   });
   app.listen(8787, '127.0.0.1', () => log('http ingress on :8787'));
 };
+// One queue iteration: pick up a single task, run it serially, publish the
+// result. Returns the result, or null when nothing was queued. Throws on
+// transport failures so the caller (run) can back off and keep looping
+// forever; one bad task can never wedge later ones.
+async function runOnce(cfg, source, executor) {
+  const t = await source.next();
+  if (!t) return null;
+  if (t.secret !== cfg.bridge_secret) { log('secret mismatch, rejected', t.id); return null; }
+  log('pickup task', t.id, t.repo);
+  log('task', t.id, t.repo);
+  const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
+  status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
+  const res = await serial(() => handle(cfg, executor, t, statusSend));
+  status.notify(statusSend, status.buildEvent(terminalEvent(res.status), { id: res.id, sessionId: res.session_id, branch: res.branch, detail: res.status, summary: terminalEvent(res.status) === 'done' ? res.summary : undefined, error: terminalEvent(res.status) === 'failed' ? res.summary : undefined }));
+  await source.sendResult(res);
+  log('result', res.id, res.status, 'session', res.session_id || '(none)', '| open:', res.open_command || '(no session captured)');
+  return res;
+}
+exports.runOnce = runOnce;
 exports.run = async (cfg) => {
   const { source, executor } = exports.load(cfg);
   log('bridge up; repos:', Object.keys(cfg.repos).join(', '));
@@ -163,13 +208,7 @@ exports.run = async (cfg) => {
   log('ingress started');
   for (;;) {
     try {
-      const t = await source.next();
-      if (!t) continue;
-      if (t.secret !== cfg.bridge_secret) { log('secret mismatch, rejected', t.id); continue; }
-      log('task', t.id, t.repo);
-      const res = await serial(() => handle(cfg, executor, t));
-      await source.sendResult(res);
-      log('result', res.id, res.status, 'session', res.session_id || '(none)', '| open:', res.open_command || '(no session captured)');
+      await runOnce(cfg, source, executor);
     } catch (e) { log('loop error:', e.message); await new Promise(r => setTimeout(r, 5000)); }
   }
 };

@@ -27,6 +27,67 @@ exports.isWaitExhaustion = (e) => {
   const msg = String((e && e.message) || e || '');
   return (e && e.code === 'STILL_RUNNING') || /still running remotely|opencode wait timeout/i.test(msg);
 };
+
+// POST /prompt returned 2xx but no user message appeared: the turn never
+// entered the queue (e.g. a dropped enqueue). Failing fast here distinguishes
+// "never delivered" from "delivered but stuck".
+function promptNotAcceptedError(sid) {
+  const err = new Error(
+    sid
+      ? `prompt not accepted (session ${sid}); no user message landed after POST /prompt; open with: opencode --session ${sid}`
+      : 'prompt not accepted (session unknown)',
+  );
+  if (sid) err.sessionId = sid;
+  err.code = 'PROMPT_NOT_ACCEPTED';
+  return err;
+}
+exports.promptNotAcceptedError = promptNotAcceptedError;
+
+// Wait exhausted with zero new activity since the prompt: nothing streamed,
+// no idle, not even our user message visible. The turn most likely never
+// started (pending permission approval or question with no attached UI to
+// answer it, or a stalled session). Never auto-approve; report where to look.
+function stalledNoProgressError(sid, elapsedMin) {
+  const err = new Error(
+    sid
+      ? `no progress in ~${elapsedMin}m (session ${sid}); turn never started - check the UI for a pending permission approval or question, then open with: opencode --session ${sid}`
+      : 'no progress since prompt; turn never started',
+  );
+  if (sid) err.sessionId = sid;
+  err.code = 'STALLED_NO_PROGRESS';
+  return err;
+}
+exports.stalledNoProgressError = stalledNoProgressError;
+
+// Clock-skew tolerance when comparing bridge clock to server message times.
+const TIME_SKEW_MS = 5000;
+exports.TIME_SKEW_MS = TIME_SKEW_MS;
+
+function userMessageLanded(data, since) {
+  return (data || []).some((m) => m && m.type === 'user' && m.time && m.time.created >= since - TIME_SKEW_MS);
+}
+exports.userMessageLanded = userMessageLanded;
+
+function latestActivity(data) {
+  let max = 0;
+  for (const m of data || []) {
+    const t = m && m.time && m.time.created;
+    if (typeof t === 'number' && t > max) max = t;
+  }
+  return max;
+}
+exports.latestActivity = latestActivity;
+
+// Choose the exhaustion error: a silent stall (nothing new at all) gets the
+// actionable STALLED code; a turn that produced output but never went idle
+// keeps the existing STILL_RUNNING still-running report.
+function decideExhaustion({ data, sid, promptAt, now }) {
+  if (latestActivity(data) <= promptAt - TIME_SKEW_MS) {
+    return stalledNoProgressError(sid, Math.max(1, Math.round((now - promptAt) / 60000)));
+  }
+  return stillRunningError(sid);
+}
+exports.decideExhaustion = decideExhaustion;
 let server = null;
 const sessions = new Map(); // cwd -> sessionId
 let AUTH = null;
@@ -84,7 +145,19 @@ exports.create = (cfg) => {
         sessions.set(cwd, sid);
       }
       const startedAt = Date.now();
+      const promptAt = startedAt;
       await api('POST', `/api/session/${sid}/prompt`, { text: task });
+
+      // Delivery check: the prompt call can return 2xx without the turn ever
+      // entering the queue. Confirm our user message landed (3 tries); fail
+      // fast with the session id instead of burning the full wait.
+      let landed = false;
+      for (let i = 0; i < 3 && !landed; i++) {
+        if (i) await new Promise((r) => setTimeout(r, 2000));
+        const check = await api('GET', `/api/session/${sid}/message?order=desc&limit=10`);
+        landed = userMessageLanded(check.data || [], promptAt);
+      }
+      if (!landed) throw promptNotAcceptedError(sid);
 
       // Generous floor: even if the caller passes the old 30min timeout,
       // wait at least DEFAULT_WAIT_MS so long tasks are not cut off.
@@ -103,7 +176,10 @@ exports.create = (cfg) => {
         }
         await new Promise(r => setTimeout(r, 2000));
       }
-      if (!last) throw stillRunningError(sid);
+      if (!last) {
+        const tail = await api('GET', `/api/session/${sid}/message?order=desc&limit=10`).catch(() => null);
+        throw decideExhaustion({ data: (tail && tail.data) || [], sid, promptAt, now: Date.now() });
+      }
       const text = last.content.filter(p => p.type === 'text').map(p => p.text).join('\n');
       return { summary: text || '(no assistant text)', sessionId: sid, questions: [] };
     },
