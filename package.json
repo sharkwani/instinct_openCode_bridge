@@ -1,0 +1,19 @@
+{
+  "name": "instinct-bridge",
+  "version": "0.2.0",
+  "description": "Poll-out bridge: supervising AI -> queue -> coding agent on your machine. No open ports, no deps.",
+  "bin": {
+    "bridge": "bin/bridge.js"
+  },
+  "scripts": {
+    "init": "node bin/bridge.js init",
+    "start": "node bin/bridge.js start"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
