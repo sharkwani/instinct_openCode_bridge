@@ -2,10 +2,6 @@
 
 # 🌉 instinct-bridge <sub><sup>(public source copy)</sup></sub>
 
-[![typing](https://readme-typing-svg.demolab.com?font=Fira+Code&pause=1000&color=58A6FF&center=true&vCenter=true&width=640&lines=Poll-out+bridge%3A+no+inbound+ports;Supervising+AI+%E2%9E%9C+queue+%E2%9E%9C+coding+agent;One+task%2C+one+branch%2C+every+time)](https://github.com/DenverCoder1/readme-typing-svg)
-
-*Animated header rendered with [readme-typing-svg](https://github.com/DenverCoder1/readme-typing-svg).*
-
 ![node](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![transport](https://img.shields.io/badge/transport-Upstash_Redis_REST-00C7B7?logo=redis&logoColor=white)
@@ -172,6 +168,6 @@ node bin/bridge.js result [secs]
 
 <div align="center">
 
-<sub>Header animation by <a href="https://github.com/DenverCoder1/readme-typing-svg">readme-typing-svg</a> · Badges via shields.io · MIT licensed</sub>
+<sub>Badges via shields.io · MIT licensed</sub>
 
 </div>
