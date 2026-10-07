@@ -26,6 +26,24 @@ exports.terminalEvent = terminalEvent;
 const openCommand = (sid) => sid ? `opencode --session ${sid}` : '';
 exports.openCommand = openCommand;
 
+// Task output visibility: final assistant response / stdout / error details
+// are carried in result JSON field `output` (GET /results/:id). `summary`
+// is kept unchanged for compatibility. Capped at 12KB, truncation labeled,
+// secrets scrubbed, raw .env values never exposed. No broad logging here.
+const MAX_OUTPUT_CHARS = 12 * 1024;
+const TRUNC_SUFFIX = '\n[truncated: output exceeded 12KB]';
+function toSafeOutput(raw) {
+  let out = raw == null ? '' : String(raw);
+  try { out = status.scrub(out); } catch {}
+  // Redact dotenv-style assignments (KEY=value) so raw .env contents never
+  // leak via echoed output; keep the key name for debuggability.
+  out = out.replace(/^([A-Z_][A-Z0-9_]*)\s*=\s*\S.*$/gm, '$1=[redacted]');
+  if (out.length > MAX_OUTPUT_CHARS) out = out.slice(0, MAX_OUTPUT_CHARS) + TRUNC_SUFFIX;
+  return out;
+}
+exports.MAX_OUTPUT_CHARS = MAX_OUTPUT_CHARS;
+exports.toSafeOutput = toSafeOutput;
+
 // adapters are chosen in config by file name: "source": "source-upstash", "executor": "executor-opencode"
 exports.load = (cfg) => ({
   source: require(path.join(__dirname, '..', 'adapters', cfg.source || 'source-upstash')).create(cfg),
@@ -38,7 +56,7 @@ let tail = Promise.resolve();
 const serial = (fn) => { const res = tail.then(fn); tail = res.catch(() => {}); return res; };
 
 async function handle(cfg, executor, t, statusSend) {
-  const res = { id: t.id, status: 'error', branch: null, session_id: t.session_id || null, open_command: '', summary: '', diffstat: '', questions: [] };
+  const res = { id: t.id, status: 'error', branch: null, session_id: t.session_id || null, open_command: '', summary: '', output: '', diffstat: '', questions: [] };
   // Capture the submission-time session ID immediately so a later wait
   // timeout still reports where to look. Executor-created sessions are
   // merged in after run() and, on failure, from err.sessionId.
@@ -59,6 +77,7 @@ async function handle(cfg, executor, t, statusSend) {
     try {
       const r = await executor.run({ task: t.task, cwd, sessionId: t.session_id, timeoutMs: (cfg.task_timeout_minutes || 30) * 60000 });
       res.session_id = r.sessionId || res.session_id; res.summary = r.summary; res.questions = r.questions || [];
+      res.output = toSafeOutput(r.output ?? r.stdout ?? r.summary ?? '');
       res.open_command = openCommand(res.session_id);
       log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)');
       res.status = res.questions.length ? 'needs_input' : 'done';
@@ -89,12 +108,15 @@ async function handle(cfg, executor, t, statusSend) {
       } else {
         res.summary = msg;
       }
+      const errExtra = [e && e.stdout, e && e.stderr, e && e.output].filter((v) => typeof v === 'string' && v).join('\n');
+      res.output = toSafeOutput(errExtra ? `${res.summary}\n${errExtra}` : res.summary);
     }
     const now = await git(cwd, 'rev-parse', '--abbrev-ref', 'HEAD');
     if (now !== branch || PROTECTED.includes(now)) { res.status = 'error'; res.summary += `\n[bridge] HEAD is ${now}; expected ${branch}`; }
     res.diffstat = await git(cwd, 'diff', '--stat', `${base}...${branch}`).catch(() => '');
     if (await git(cwd, 'status', '--porcelain')) res.diffstat += '\n[bridge] uncommitted changes remain on branch';
   } catch (e) { res.summary = res.summary || String(e.message || e); }
+  if (!res.output) res.output = toSafeOutput(res.summary || '');
   // HOOK: secret sanitization goes here (scrub res.summary / res.diffstat before it leaves the machine).
   return res;
 }
@@ -167,7 +189,8 @@ exports.startHttp = (cfg) => {
       fs.appendFileSync(resultsFile, JSON.stringify(r) + '\n');
       status.notify(statusSend, status.buildEvent(terminalEvent(r.status), { id: r.id, sessionId: r.session_id, branch: r.branch, detail: r.status, summary: r.status === 'done' || r.status === 'needs_input' ? r.summary : undefined, error: terminalEvent(r.status) === 'failed' ? r.summary : undefined }));
     }).catch((err) => {
-      const failed = { id: t.id, status: 'error', branch: null, session_id: null, summary: String((err && err.message) || err), diffstat: '', questions: [] };
+      const summary = String((err && err.message) || err);
+      const failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
       results.set(t.id, failed);
       log('task crashed', t.id, failed.summary);
       try { fs.appendFileSync(resultsFile, JSON.stringify(failed) + '\n'); } catch {}
