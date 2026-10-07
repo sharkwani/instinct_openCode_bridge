@@ -49,6 +49,70 @@ node bin/bridge.js result [secs]
 - Secret scrubbing is a `HOOK` placeholder in `src/core.js`, not an implemented sanitizer.
 - Dirty-tree refusal is NOT enforced: the check in `src/core.js` is commented out.
 
+## Permissions
+
+- Command and file permissions are controlled by OpenCode's own `opencode.json`, not by this bridge - the bridge runs whatever the user's OpenCode config allows, and there are no bridge-level prompts.
+- Recommended starting example:
+
+```json
+{
+  "permission": {
+    "read": {
+      "*": "allow",
+      ".env": "deny",
+      ".env.*": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "edit": {
+      "*": "deny",
+      "adapters/*": "allow",
+      "src/*": "allow",
+      "bin/*": "allow",
+      "test/*": "allow",
+      "LICENSE": "allow",
+      "README.md": "allow",
+      "package.json": "allow",
+      "bridge.config.json": "deny",
+      "opencode.json": "deny",
+      ".env": "deny",
+      ".env.*": "deny",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.log": "deny",
+      "results.jsonl": "deny"
+    },
+    "bash": {
+      "*": "ask",
+      "git": "allow",
+      "git *": "allow",
+      "npm": "allow",
+      "npm *": "allow",
+      "node": "allow",
+      "node *": "allow",
+      "npx": "allow",
+      "npx *": "allow",
+      "git push": "deny",
+      "git push *": "deny",
+      "sudo": "deny",
+      "sudo *": "deny",
+      "rm -rf *": "deny"
+    },
+    "external_directory": {
+      "*": "deny"
+    },
+    "webfetch": "ask",
+    "websearch": "ask"
+  }
+}
+```
+
+- A full-allow config (`"*": "allow"` everywhere) is an option for users who want zero prompts, and each user picks what fits their risk comfort.
+
 ## Verify on your machine
 
 - If summaries or session IDs come back empty, run your opencode command once by hand and adjust the defensive JSON parsing in the executor.
