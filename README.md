@@ -53,6 +53,17 @@ node bin/bridge.js push <repo> "<task>" [session_id]
 node bin/bridge.js result [secs]
 ```
 
+## 💬 Asking Instinct to do work
+
+Once the daemon is running (`node bin/bridge.js start`), ask Instinct in plain words, naming one of your configured repos and the task. Example: `In repo my-site, add a contact form section to the homepage and verify the page still builds`.
+
+Instinct submits that task through the bridge queue; your machine picks it up, OpenCode does the work on a per-task `bridge/<task-id>` branch, and Instinct returns the result to you.
+
+## 🔑 Secrets: `bridge_secret` and `openCodeServerPassword`
+
+- `bridge_secret`: generated during `node bin/bridge.js init` and stored only in your local `bridge.config.json` (chmod 600 — never commit it). Enter it once in Instinct's bridge credential setup so Instinct can submit tasks to your bridge. Never paste it into ordinary chat or commit it to Git.
+- `openCodeServerPassword`: the password protecting your OpenCode server. Set it in your bridge config (also accepted via `OPENCODE_SERVER_PASSWORD`) so it matches your configured `opencode serve` password. Like `bridge_secret`, keep it out of chat and Git.
+
 ---
 
 ## ⚙️ How it works
