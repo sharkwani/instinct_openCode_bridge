@@ -1,47 +1,110 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
 const PROJECT_JSON = path.join(__dirname, '..', 'opencode.json');
 const load = () => JSON.parse(fs.readFileSync(PROJECT_JSON, 'utf8'));
-const bridgeRepos = () => {
-  try {
-    return Object.values(require('../bridge.config.json').repos || {});
-  } catch {
-    return [path.join(os.tmpdir(), 'instinct-bridge-test')];
-  }
+
+const EXPECTED_RELATIVE_ALLOWS = [
+  'adapters/*',
+  'bin/*',
+  'src/*',
+  'test/*',
+  'LICENSE',
+  'README.md',
+  'package.json',
+];
+
+const PROTECTED_EDIT_DENIES = [
+  'bridge.config.json',
+  'opencode.json',
+  '.env',
+  '.env.*',
+  '*.env',
+  '*.env.*',
+  '*.log',
+  'results.jsonl',
+];
+
+const isAbsolutePosix = (p) => p.startsWith('/');
+const isWindowsDrive = (p) => /^[A-Za-z]:[\\/]/.test(p);
+const isUnc = (p) => p.startsWith('\\\\');
+const isHomeExpansion = (p) => p === '~' || p.startsWith('~/');
+const isGenericCatchAll = (p) => p === '*' || p === '**';
+
+const isInvalidEditAllow = (p) => {
+  if (isAbsolutePosix(p)) return true;
+  if (isWindowsDrive(p)) return true;
+  if (isUnc(p)) return true;
+  if (isHomeExpansion(p)) return true;
+  if (p.includes('..')) return true;
+  if (isGenericCatchAll(p)) return true;
+  if (PROTECTED_EDIT_DENIES.includes(p)) return true;
+  return false;
 };
 
 describe('bridge approval config: project-scoped, no yolo', () => {
   it('opencode.json exists with schema and object permission (never bare allow)', () => {
     assert.ok(fs.existsSync(PROJECT_JSON), 'opencode.json must exist at project root');
-    const cfg = load();
+    const raw = fs.readFileSync(PROJECT_JSON, 'utf8');
+    const cfg = JSON.parse(raw);
     assert.equal(cfg.$schema, 'https://opencode.ai/config.json');
     assert.ok(cfg.permission && typeof cfg.permission === 'object', 'permission must be an object, not allow');
     assert.notEqual(cfg.permission['*'], 'allow', 'no global allow-all');
   });
 
-  it('edit is deny-by-default with allow only under bridge repo roots', () => {
+  it('edit is deny-by-default with project-scoped relative allows only', () => {
     const edit = load().permission.edit;
     assert.ok(edit && typeof edit === 'object');
     assert.equal(edit['*'], 'deny', 'edit catch-all must be deny');
-    const repos = bridgeRepos();
     const allows = Object.entries(edit).filter(([, v]) => v === 'allow').map(([k]) => k);
     assert.ok(allows.length > 0, 'need at least one edit allow');
-    for (const a of allows) {
-      // Absolute allows must sit under a bridge root; relative allows are
-      // project-scoped by definition but must not escape with '..'.
-      // ('*' is segment-scoped: it does not cross '/', hence per-dir entries.)
-      if (a.startsWith('/')) {
-        assert.ok(repos.some((r) => a.startsWith(r)), `edit allow pattern outside bridge roots: ${a}`);
-      } else {
-        assert.ok(!a.includes('..'), `edit allow pattern escapes project: ${a}`);
-      }
+    for (const a of EXPECTED_RELATIVE_ALLOWS) {
+      assert.equal(edit[a], 'allow', `expected shipped edit allow: ${a}`);
     }
-    for (const r of repos) {
-      assert.ok(allows.some((a) => a.startsWith(r)), `repo root not covered by edit allow: ${r}`);
+    for (const a of allows) {
+      assert.ok(!isAbsolutePosix(a), `absolute POSIX path not allowed: ${a}`);
+      assert.ok(!isWindowsDrive(a), `Windows drive path not allowed: ${a}`);
+      assert.ok(!isUnc(a), `UNC path not allowed: ${a}`);
+      assert.ok(!isHomeExpansion(a), `home expansion not allowed: ${a}`);
+      assert.ok(!a.includes('..'), `edit allow pattern escapes project: ${a}`);
+      assert.ok(!isGenericCatchAll(a), `generic catch-all allow not permitted: ${a}`);
+      assert.ok(!PROTECTED_EDIT_DENIES.includes(a), `protected file must not be allowed: ${a}`);
+      assert.ok(!a.startsWith('/'), `edit allows must be relative project-scoped: ${a}`);
+    }
+  });
+
+  it('edit explicitly denies protected config/env/runtime files', () => {
+    const edit = load().permission.edit;
+    for (const p of PROTECTED_EDIT_DENIES) {
+      assert.equal(edit[p], 'deny', `protected path must be explicitly denied: ${p}`);
+    }
+  });
+
+  it('edit rejects invalid path rules and protected files (negative cases)', () => {
+    const invalid = [
+      '/tmp/evil',
+      '/Users/someone/repo',
+      'C:\\Windows\\evil',
+      'C:/evil',
+      '\\\\server\\share',
+      '~/evil',
+      '../escape',
+      'src/../../escape',
+      '*',
+      '**',
+      'bridge.config.json',
+      'opencode.json',
+      '.env',
+      'results.jsonl',
+    ];
+    for (const p of invalid) {
+      assert.ok(isInvalidEditAllow(p), `expected invalid edit allow to be rejected: ${p}`);
+    }
+    const valid = [...EXPECTED_RELATIVE_ALLOWS];
+    for (const p of valid) {
+      assert.ok(!isInvalidEditAllow(p), `expected valid edit allow to be accepted: ${p}`);
     }
   });
 
@@ -75,5 +138,18 @@ describe('bridge approval config: project-scoped, no yolo', () => {
     const p = load().permission;
     assert.equal(p.webfetch, 'ask');
     assert.equal(p.websearch, 'ask');
+  });
+
+  it('read/glob/grep/list stay permissive with env-file denials on read', () => {
+    const p = load().permission;
+    assert.equal(p.glob, 'allow');
+    assert.equal(p.grep, 'allow');
+    assert.equal(p.list, 'allow');
+    const read = p.read;
+    assert.ok(read && typeof read === 'object');
+    assert.equal(read['*'], 'allow');
+    for (const pat of ['.env', '.env.*', '*.env', '*.env.*']) {
+      assert.equal(read[pat], 'deny', `expected read deny: ${pat}`);
+    }
   });
 });
