@@ -44,7 +44,7 @@ node bin/bridge.js init    # prompts for Upstash URL/token, tests them, adds rep
 node bin/bridge.js start  # runs the daemon
 ```
 
-> 🔒 `bridge.config.json` is local-only state created by `init`. **Never commit it.** It holds `upstash_url`, `upstash_token`, `bridge_secret`, optional `opencodeServerPassword`, plus `source`, `executor`, `poll_seconds`, `task_timeout_minutes`, `opencode_bin`, `model`, and `repos` (`{name: absolutePath}`).
+> 🔒 `bridge.config.json` is local-only state created by `init`. **Never commit it.** It holds `upstash_url`, `upstash_token`, `bridge_secret`, optional `openCodeServerPassword` (also accepted via `OPENCODE_SERVER_PASSWORD`), plus `source`, `executor`, `poll_seconds`, `task_timeout_minutes`, `opencode_bin`, `model`, and `repos` (`{name: absolutePath}`). `bridge_secret` is shared with Instinct over a secure link; `openCodeServerPassword` is the password for the user's OpenCode server.
 
 CLI (see `bin/bridge.js`):
 
