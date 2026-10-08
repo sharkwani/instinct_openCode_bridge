@@ -16,6 +16,12 @@ Queue transport needs no inbound ports. The daemon also serves a loopback-only H
 
 ---
 
+## 🎬 Demo — Instinct + OpenCode collaboration
+
+![Animated demo showing Instinct submitting a coding task through instinct-bridge, OpenCode executing it on a per-task git branch, and the result returning to Instinct](assets/instinct-opencode-collaboration-v17.gif)
+
+---
+
 ## ✨ What you get
 
 | | |
