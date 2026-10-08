@@ -69,6 +69,7 @@ Instinct submits that task through the bridge queue; your machine picks it up, O
 
 - `bridge_secret`: generated during `node bin/bridge.js init` and stored only in your local `bridge.config.json` (chmod 600 — never commit it). Enter it once in Instinct's bridge credential setup so Instinct can submit tasks to your bridge. Never paste it into ordinary chat or commit it to Git.
 - `openCodeServerPassword`: the password protecting your OpenCode server. Set it in your bridge config (also accepted via `OPENCODE_SERVER_PASSWORD`) so it matches your configured `opencode serve` password. Like `bridge_secret`, keep it out of chat and Git.
+- Client integration: send `bridge_secret` in the `X-Bridge-Secret` HTTP header on every authenticated bridge request. Never send it in the URL/query string (to avoid proxy/CDN logs) or in a GET body (which clients/proxies may strip).
 
 ---
 
