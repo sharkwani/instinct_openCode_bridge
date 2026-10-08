@@ -44,6 +44,21 @@ function toSafeOutput(raw) {
 exports.MAX_OUTPUT_CHARS = MAX_OUTPUT_CHARS;
 exports.toSafeOutput = toSafeOutput;
 
+// Bridge secret: task submission (POST /tasks) historically carried it in
+// the JSON/urlencoded body, while result reads (GET /results/:id) required
+// the X-Bridge-Secret header. Instinct sends the same secret the same way
+// for both, so reads failed with {error:'bad secret'}. Accept the secret
+// from header, ?secret= query, or body on every gated endpoint.
+function getReqSecret(req) {
+  if (!req) return undefined;
+  const viaHeader = typeof req.get === 'function' ? req.get('X-Bridge-Secret') : undefined;
+  if (viaHeader) return viaHeader;
+  if (req.query && typeof req.query.secret === 'string' && req.query.secret) return req.query.secret;
+  if (req.body && typeof req.body.secret === 'string' && req.body.secret) return req.body.secret;
+  return undefined;
+}
+exports.getReqSecret = getReqSecret;
+
 // adapters are chosen in config by file name: "source": "source-upstash", "executor": "executor-opencode"
 exports.load = (cfg) => ({
   source: require(path.join(__dirname, '..', 'adapters', cfg.source || 'source-upstash')).create(cfg),
@@ -122,10 +137,10 @@ async function handle(cfg, executor, t, statusSend) {
 }
 exports._handle = handle;
 
-exports.startHttp = (cfg) => {
+exports.startHttp = (cfg, opts = {}) => {
   const { executor, source } = exports.load(cfg);
   const statusSend = source && typeof source.sendStatus === 'function' ? source.sendStatus.bind(source) : null;
-  const resultsFile = path.join(__dirname, '..', 'results.jsonl');
+  const resultsFile = (opts && opts.resultsFile) || path.join(__dirname, '..', 'results.jsonl');
   const results = new Map();
   if (fs.existsSync(resultsFile)) {
     for (const line of fs.readFileSync(resultsFile, 'utf8').split('\n')) {
@@ -159,7 +174,7 @@ exports.startHttp = (cfg) => {
 });
 
   app.post('/results/view', (req, res) => {
-  if ((req.body || {}).secret !== cfg.bridge_secret) { log('reject /results/view: bad secret, id=', (req.body || {}).id); return res.status(401).send('bad secret'); }
+  if (getReqSecret(req) !== cfg.bridge_secret) { log('reject /results/view: bad secret, id=', (req.body || {}).id); return res.status(401).send('bad secret'); }
   const r = results.get((req.body || {}).id);
   if (!r) return res.status(404).send('unknown id');
   const esc = (s) => String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
@@ -168,15 +183,22 @@ exports.startHttp = (cfg) => {
 });
 
   app.get('/results', (req, res) => {
+    const supplied = getReqSecret(req);
+    // Machine clients read JSON with the same secret used for submission
+    // (header, ?secret=, or body). Browsers with no secret get the HTML form.
+    if (supplied !== undefined) {
+      if (supplied !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
+      return res.json([...results.values()]);
+    }
     res.type('html').send('<form method="post" action="/results/view">' +
     '<input name="id" placeholder="id">' +
     '<input name="secret" type="password" placeholder="secret">' +
     '<button>view</button></form>');
-});
+  });
   app.post('/tasks', (req, res) => {
     const t = req.body || {};
     log('submission from', req.ip, 'id=', t.id, 'repo=', t.repo);
-    if (t.secret !== cfg.bridge_secret) { log('reject id=', t.id, ': bad secret'); return res.status(401).json({ error: 'bad secret' }); }
+    if (getReqSecret(req) !== cfg.bridge_secret) { log('reject id=', t.id, ': bad secret'); return res.status(401).json({ error: 'bad secret' }); }
     if (!t.id || !t.repo || !t.task) { log('reject id=', t.id, ': missing fields: need {id, repo, task, secret}'); return res.status(400).json({ error: 'need {id, repo, task, secret}' }); }
     if (results.has(t.id)) { log('reject id=', t.id, ': duplicate id'); return res.status(409).json({ error: 'duplicate id' }); }
     results.set(t.id, { id: t.id, status: 'running' });
@@ -187,23 +209,25 @@ exports.startHttp = (cfg) => {
       results.set(r.id, r);
       log('task finished', r.id, r.status, 'session', r.session_id || '(none)', '| open:', r.open_command || '(no session captured)', r.summary ? String(r.summary).split('\n')[0].slice(0,120) : '');
       fs.appendFileSync(resultsFile, JSON.stringify(r) + '\n');
-      status.notify(statusSend, status.buildEvent(terminalEvent(r.status), { id: r.id, sessionId: r.session_id, branch: r.branch, detail: r.status, summary: r.status === 'done' || r.status === 'needs_input' ? r.summary : undefined, error: terminalEvent(r.status) === 'failed' ? r.summary : undefined }));
+      status.notify(statusSend, status.buildEvent(terminalEvent(r.status), { id: r.id, sessionId: r.session_id, branch: r.branch, detail: r.status, summary: r.status === 'done' || r.status === 'needs_input' ? r.summary : undefined, error: terminalEvent(r.status) === 'failed' ? r.summary : undefined, output: r.output || undefined }));
     }).catch((err) => {
       const summary = String((err && err.message) || err);
       const failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
       results.set(t.id, failed);
       log('task crashed', t.id, failed.summary);
       try { fs.appendFileSync(resultsFile, JSON.stringify(failed) + '\n'); } catch {}
-      status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary }));
+      status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary, output: failed.output }));
     });
   });
   app.get('/results/:id', (req, res) => {
-    if (req.get('X-Bridge-Secret') !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
+    if (getReqSecret(req) !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
     const r = results.get(req.params.id);
     if (!r) return res.status(404).json({ error: 'unknown id' });
     res.json(r);
   });
-  app.listen(8787, '127.0.0.1', () => log('http ingress on :8787'));
+  const port = (opts && opts.port) || 8787;
+  const server = app.listen(port, '127.0.0.1', () => log('http ingress on :' + port));
+  return { app, server, results };
 };
 // One queue iteration: pick up a single task, run it serially, publish the
 // result. Returns the result, or null when nothing was queued. Throws on
@@ -218,7 +242,7 @@ async function runOnce(cfg, source, executor) {
   const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
   status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
   const res = await serial(() => handle(cfg, executor, t, statusSend));
-  status.notify(statusSend, status.buildEvent(terminalEvent(res.status), { id: res.id, sessionId: res.session_id, branch: res.branch, detail: res.status, summary: terminalEvent(res.status) === 'done' ? res.summary : undefined, error: terminalEvent(res.status) === 'failed' ? res.summary : undefined }));
+  status.notify(statusSend, status.buildEvent(terminalEvent(res.status), { id: res.id, sessionId: res.session_id, branch: res.branch, detail: res.status, summary: terminalEvent(res.status) === 'done' ? res.summary : undefined, error: terminalEvent(res.status) === 'failed' ? res.summary : undefined, output: res.output || undefined }));
   await source.sendResult(res);
   log('result', res.id, res.status, 'session', res.session_id || '(none)', '| open:', res.open_command || '(no session captured)');
   return res;

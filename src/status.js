@@ -7,13 +7,18 @@
 // is not listening, events accumulate harmlessly alongside results.
 //
 // Safety: events contain only {event, id, session_id, timestamp,
-// status/detail, branch, summary/error truncated+scrubbed}. They NEVER
-// include task text, source diffs, config values, or secrets.
+// status/detail, branch, summary/error truncated+scrubbed, output full-text
+// capped+scrubbed}. They NEVER include task text, source diffs, config
+// values, or secrets.
 const log = (...a) => console.log(new Date().toISOString(), '[status]', ...a);
 
 const MAX_TEXT = 500;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 200;
+// Full task output carried on terminal events (done/failed). Preserves
+// newlines; capped at 12KB like core.toSafeOutput, truncation labeled.
+const MAX_OUTPUT = 12 * 1024;
+const OUTPUT_TRUNC_SUFFIX = '\n[truncated: output exceeded 12KB]';
 
 // Scrub anything that looks like a credential if it ever leaks into a
 // summary/error string. Conservative: redacts bearer tokens, key=value
@@ -31,7 +36,13 @@ function safeText(s) {
   return t;
 }
 
-function buildEvent(state, { id, sessionId, summary, error, branch, detail }) {
+function safeOutput(s) {
+  let out = scrub(s == null ? '' : String(s));
+  if (out.length > MAX_OUTPUT) out = out.slice(0, MAX_OUTPUT) + OUTPUT_TRUNC_SUFFIX;
+  return out;
+}
+
+function buildEvent(state, { id, sessionId, summary, error, branch, detail, output }) {
   return {
     event: state, // queued|running|done|failed
     id,
@@ -42,6 +53,7 @@ function buildEvent(state, { id, sessionId, summary, error, branch, detail }) {
     ...(detail ? { detail } : {}),
     ...(summary ? { summary: safeText(summary) } : {}),
     ...(error ? { error: safeText(error) } : {}),
+    ...(output ? { output: safeOutput(output) } : {}),
   };
 }
 
@@ -69,4 +81,4 @@ function notify(send, event) {
   setImmediate(() => { emit(send, event).catch(() => {}); });
 }
 
-module.exports = { buildEvent, emit, notify, scrub, safeText, MAX_TEXT, MAX_ATTEMPTS };
+module.exports = { buildEvent, emit, notify, scrub, safeText, safeOutput, MAX_TEXT, MAX_OUTPUT, MAX_ATTEMPTS };
