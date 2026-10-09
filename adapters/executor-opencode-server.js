@@ -165,14 +165,43 @@ exports.create = (cfg) => {
       const deadline = Date.now() + waitMs;
       let last = null;
       while (Date.now() < deadline) {
-        const msgs = await api('GET', `/api/session/${sid}/message?order=desc&limit=10`);
-        const data = msgs.data || [];
-        // The turn isn't done until an idle message lands; assistant content streams
-        // in progressively before that, so returning early yields fragments.
-        const finished = data.some(m => m.type === 'idle' && m.time && m.time.created > startedAt);
-        if (finished) {
-          const candidates = data.filter(m => m.type === 'assistant' && m.time && m.time.created > startedAt && (m.content || []).some(p => p.type === 'text' && p.text.trim()));
-          if (candidates.length) { last = candidates.sort((a, b) => b.time.created - a.time.created)[0]; break; }
+        const active = await api('GET', '/api/session/active');
+        if (!active || !active.data || typeof active.data !== 'object') {
+          throw new Error('Invalid OpenCode active-session response');
+        }
+        if (!Object.prototype.hasOwnProperty.call(active.data, sid)) {
+          const msgs = await api('GET', `/api/session/${sid}/message?order=desc&limit=10`);
+          const data = msgs.data || [];
+          // A historical idle anywhere in the page is not a completion gate.
+          const idle = data[0];
+          if (idle?.type === 'idle' && idle.time?.created > startedAt) {
+            if (idle.outcome !== 'succeeded') {
+              const err = new Error(`OpenCode turn ${idle.outcome || 'unknown'} (session ${sid})`);
+              err.sessionId = sid;
+              throw err;
+            }
+            // Filter before pagination, so intervening non-text messages cannot
+            // hide the newest assistant response behind the 10-message limit.
+            const reply = await api('GET', `/api/session/${sid}/message?order=desc&limit=1&type=assistant`);
+            const candidate = (reply.data || [])[0];
+            if (candidate?.time?.created > startedAt &&
+                candidate.time.completed != null &&
+                candidate.time.completed <= idle.time.created &&
+                (candidate.content || []).some(p => p.type === 'text' && typeof p.text === 'string' && p.text.trim())) {
+              // Revalidate the boundary after fetching text. A successor drain
+              // must not make an old idle/ack snapshot look terminal.
+              const tail = await api('GET', `/api/session/${sid}/message?order=desc&limit=1`);
+              const current = await api('GET', '/api/session/active');
+              if (!current || !current.data || typeof current.data !== 'object') {
+                throw new Error('Invalid OpenCode active-session response');
+              }
+              if ((tail.data || [])[0]?.id === idle.id &&
+                  !Object.prototype.hasOwnProperty.call(current.data, sid)) {
+                last = candidate;
+                break;
+              }
+            }
+          }
         }
         await new Promise(r => setTimeout(r, 2000));
       }
