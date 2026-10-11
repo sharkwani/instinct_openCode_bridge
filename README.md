@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🌉 instinct-bridge <sub><sup>(public source copy)</sup></sub>
+# 🌉 instinct-bridge
 
 ![node](https://img.shields.io/badge/node-%3E%3D18-339933?logo=node.js&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-blue)
