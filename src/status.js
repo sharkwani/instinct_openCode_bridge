@@ -22,9 +22,14 @@ const OUTPUT_TRUNC_SUFFIX = '\n[truncated: output exceeded 12KB]';
 
 // Scrub anything that looks like a credential if it ever leaks into a
 // summary/error string. Conservative: redacts bearer tokens, key=value
-// secrets, and long hex blobs.
+// secrets, and long hex blobs. Plus central registry redaction when loaded
+// (nested/encoded/base64 variants, longest-first). No secret output.
 function scrub(s) {
   let out = String(s || '');
+  try {
+    const { sanitizeString } = require('./sanitizer');
+    out = sanitizeString(out);
+  } catch {}
   out = out.replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer [redacted]');
   out = out.replace(/(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*\S+/gi, '$1=[redacted]');
   out = out.replace(/\b[0-9a-f]{32,}\b/gi, '[redacted]');

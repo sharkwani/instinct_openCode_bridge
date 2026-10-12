@@ -13,6 +13,7 @@ const express = require('express');
 const fs = require('node:fs');
 const PROTECTED = ['main', 'master'];
 const status = require('./status');
+const { sanitizeResult, sanitizeForPersistence, sanitizeForHttpResponse, loadSecretRegistry, sanitizeString } = require('./sanitizer');
 
 // Map a task result status to the Instinct-facing terminal event.
 // done|needs_input -> done (work produced output); error|still_running -> failed.
@@ -38,6 +39,9 @@ function toSafeOutput(raw) {
   // Redact dotenv-style assignments (KEY=value) so raw .env contents never
   // leak via echoed output; keep the key name for debuggability.
   out = out.replace(/^([A-Z_][A-Z0-9_]*)\s*=\s*\S.*$/gm, '$1=[redacted]');
+  // Central registry + pattern redaction (nested/encoded/base64 variants,
+  // longest-first, no canary exemption). Idempotent, preserves ids/sha/counts.
+  try { out = sanitizeString(out); } catch {}
   if (out.length > MAX_OUTPUT_CHARS) out = out.slice(0, MAX_OUTPUT_CHARS) + TRUNC_SUFFIX;
   return out;
 }
@@ -60,10 +64,15 @@ function getReqSecret(req) {
 exports.getReqSecret = getReqSecret;
 
 // adapters are chosen in config by file name: "source": "source-upstash", "executor": "executor-opencode"
-exports.load = (cfg) => ({
-  source: require(path.join(__dirname, '..', 'adapters', cfg.source || 'source-upstash')).create(cfg),
-  executor: require(path.join(__dirname, '..', 'adapters', cfg.executor || 'executor-opencode')).create(cfg),
-});
+exports.load = (cfg) => {
+  // Production: load secret registry internally from config (+env). No secret output.
+  // useCache:true preserves synthetic seeded registry in offline tests (skipEnv:true).
+  try { loadSecretRegistry(cfg, { useCache: true }); } catch {}
+  return {
+    source: require(path.join(__dirname, '..', 'adapters', cfg.source || 'source-upstash')).create(cfg),
+    executor: require(path.join(__dirname, '..', 'adapters', cfg.executor || 'executor-opencode')).create(cfg),
+  };
+};
 
 // Serialize all task execution (HTTP ingress + Upstash loop) so git branches and the
 // shared opencode session directory never race.
@@ -111,7 +120,7 @@ async function handle(cfg, executor, t, statusSend) {
       if (deliveryFault) {
         res.status = 'error';
         res.summary = msg;
-        log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)', '-', res.summary);
+        try { log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)', '-', sanitizeString(res.summary).split('\n')[0].slice(0, 120)); } catch { log('session', res.session_id || '(none)', 'task', t.id, res.status); }
       } else if (exhausted) {
         res.status = 'still_running';
         // Clear, actionable summary: never a bare timeout. Always includes
@@ -119,7 +128,7 @@ async function handle(cfg, executor, t, statusSend) {
         res.summary = res.session_id
           ? `still running remotely (session ${res.session_id}); open with: ${res.open_command}`
           : msg;
-        log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)', '-', res.summary);
+        try { log('session', res.session_id || '(none)', 'task', t.id, '| open:', res.open_command || '(no session captured)', '-', sanitizeString(res.summary).split('\n')[0].slice(0, 120)); } catch { log('session', res.session_id || '(none)', 'task', t.id, res.status); }
       } else {
         res.summary = msg;
       }
@@ -132,21 +141,34 @@ async function handle(cfg, executor, t, statusSend) {
     if (await git(cwd, 'status', '--porcelain')) res.diffstat += '\n[bridge] uncommitted changes remain on branch';
   } catch (e) { res.summary = res.summary || String(e.message || e); }
   if (!res.output) res.output = toSafeOutput(res.summary || '');
-  // HOOK: secret sanitization goes here (scrub res.summary / res.diffstat before it leaves the machine).
-  return res;
+  // Central boundary: every outward field (summary/output/questions/error/detail/diffstat)
+  // redacted via registry + patterns, longest-first, no canary exemption, idempotent.
+  // Preserves ids/session/branch/open_command/sha/counts. No secret output.
+  try { return sanitizeResult(res); } catch { return res; }
 }
 exports._handle = handle;
 
 exports.startHttp = (cfg, opts = {}) => {
-  const { executor, source } = exports.load(cfg);
-  const statusSend = source && typeof source.sendStatus === 'function' ? source.sendStatus.bind(source) : null;
+  // Registry: production loads internally via load() when executor/source not injected.
+  // Tests inject executor + seed registry via skipEnv:true; do not overwrite when injected.
+  let _loaded = null;
+  const _needExecutor = !(opts && opts.executor);
+  const _needSource = !(opts && opts.source) && !(opts && opts.statusSend);
+  if (_needExecutor || _needSource) { try { _loaded = exports.load(cfg); } catch {} }
+  const executor = (opts && opts.executor) || (_loaded && _loaded.executor);
+  const source = (opts && opts.source) || (_loaded && _loaded.source);
+  const statusSend = (opts && opts.statusSend) || (source && typeof source.sendStatus === 'function' ? source.sendStatus.bind(source) : null);
   const resultsFile = (opts && opts.resultsFile) || path.join(__dirname, '..', 'results.jsonl');
+  const listenPort = (opts && opts.port !== undefined) ? opts.port : 8787;
+  const listenHost = (opts && opts.host) || '127.0.0.1';
   const results = new Map();
   if (fs.existsSync(resultsFile)) {
     for (const line of fs.readFileSync(resultsFile, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       try { 
-        const r = JSON.parse(line); results.set(r.id, r); 
+        const r = JSON.parse(line);
+        // Sanitize cached history on read for display (synthetic temp files in tests).
+        try { results.set(r.id, sanitizeForHttpResponse(r)); } catch { results.set(r.id, r); }
       } catch {}
     }
   }
@@ -178,8 +200,10 @@ exports.startHttp = (cfg, opts = {}) => {
   const r = results.get((req.body || {}).id);
   if (!r) return res.status(404).send('unknown id');
   const esc = (s) => String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-  const openLine = r.session_id ? `<p>Open session: <code>${esc(r.open_command || openCommand(r.session_id))}</code></p>` : '<p>No session captured.</p>';
-  res.type('html').send(openLine + '<pre>' + JSON.stringify(r, null, 2).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
+  let safe = r;
+  try { safe = sanitizeForHttpResponse(r); } catch {}
+  const openLine = safe.session_id ? `<p>Open session: <code>${esc(safe.open_command || openCommand(safe.session_id))}</code></p>` : '<p>No session captured.</p>';
+  res.type('html').send(openLine + '<pre>' + JSON.stringify(safe, null, 2).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</pre>');
 });
 
   app.get('/results', (req, res) => {
@@ -188,7 +212,7 @@ exports.startHttp = (cfg, opts = {}) => {
     // (header, ?secret=, or body). Browsers with no secret get the HTML form.
     if (supplied !== undefined) {
       if (supplied !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
-      return res.json([...results.values()]);
+      try { return res.json([...results.values()].map((v) => sanitizeForHttpResponse(v))); } catch { return res.json([...results.values()]); }
     }
     res.type('html').send('<form method="post" action="/results/view">' +
     '<input name="id" placeholder="id">' +
@@ -206,16 +230,19 @@ exports.startHttp = (cfg, opts = {}) => {
     res.json({ id: t.id, status: 'accepted' });
     status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
     serial(() => handle(cfg, executor, t, statusSend)).then((r) => {
-      results.set(r.id, r);
-      log('task finished', r.id, r.status, 'session', r.session_id || '(none)', '| open:', r.open_command || '(no session captured)', r.summary ? String(r.summary).split('\n')[0].slice(0,120) : '');
-      fs.appendFileSync(resultsFile, JSON.stringify(r) + '\n');
-      status.notify(statusSend, status.buildEvent(terminalEvent(r.status), { id: r.id, sessionId: r.session_id, branch: r.branch, detail: r.status, summary: r.status === 'done' || r.status === 'needs_input' ? r.summary : undefined, error: terminalEvent(r.status) === 'failed' ? r.summary : undefined, output: r.output || undefined }));
+      let safe = r;
+      try { safe = sanitizeResult(r); } catch {}
+      results.set(safe.id, safe);
+      try { log('task finished', safe.id, safe.status, 'session', safe.session_id || '(none)', '| open:', safe.open_command || '(no session captured)', safe.summary ? String(sanitizeString(safe.summary)).split('\n')[0].slice(0, 120) : ''); } catch { log('task finished', safe.id, safe.status); }
+      try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(safe)) + '\n'); } catch {}
+      status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: safe.status === 'done' || safe.status === 'needs_input' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
     }).catch((err) => {
       const summary = String((err && err.message) || err);
-      const failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
+      let failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
+      try { failed = sanitizeResult(failed); } catch {}
       results.set(t.id, failed);
-      log('task crashed', t.id, failed.summary);
-      try { fs.appendFileSync(resultsFile, JSON.stringify(failed) + '\n'); } catch {}
+      log('task crashed', t.id, failed.status);
+      try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(failed)) + '\n'); } catch {}
       status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary, output: failed.output }));
     });
   });
@@ -223,10 +250,9 @@ exports.startHttp = (cfg, opts = {}) => {
     if (getReqSecret(req) !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
     const r = results.get(req.params.id);
     if (!r) return res.status(404).json({ error: 'unknown id' });
-    res.json(r);
+    try { return res.json(sanitizeForHttpResponse(r)); } catch { return res.json(r); }
   });
-  const port = (opts && opts.port) || 8787;
-  const server = app.listen(port, '127.0.0.1', () => log('http ingress on :' + port));
+  const server = app.listen(listenPort, listenHost, () => { try { log('http ingress on :' + server.address().port); } catch { log('http ingress on :' + listenPort); } });
   return { app, server, results };
 };
 // One queue iteration: pick up a single task, run it serially, publish the
@@ -242,10 +268,13 @@ async function runOnce(cfg, source, executor) {
   const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
   status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
   const res = await serial(() => handle(cfg, executor, t, statusSend));
-  status.notify(statusSend, status.buildEvent(terminalEvent(res.status), { id: res.id, sessionId: res.session_id, branch: res.branch, detail: res.status, summary: terminalEvent(res.status) === 'done' ? res.summary : undefined, error: terminalEvent(res.status) === 'failed' ? res.summary : undefined, output: res.output || undefined }));
-  await source.sendResult(res);
-  log('result', res.id, res.status, 'session', res.session_id || '(none)', '| open:', res.open_command || '(no session captured)');
-  return res;
+  // Defense-in-depth: handle() already sanitizes; re-sanitize idempotent before publish.
+  let safe = res;
+  try { safe = sanitizeResult(res); } catch {}
+  status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: terminalEvent(safe.status) === 'done' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
+  await source.sendResult(safe);
+  log('result', safe.id, safe.status, 'session', safe.session_id || '(none)', '| open:', safe.open_command || '(no session captured)');
+  return safe;
 }
 exports.runOnce = runOnce;
 exports.run = async (cfg) => {

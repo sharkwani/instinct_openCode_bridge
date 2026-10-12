@@ -4,6 +4,7 @@
 //   push(task): Promise            supervisor side: enqueue a task
 //   nextResult(waitSec): Promise<result|null>   supervisor side: read one result
 // Swap this file (e.g. Telegram, SQS, websocket) to change the transport or the supervising AI's side.
+const { sanitizeResult, sanitizeObject } = require('../src/sanitizer.js');
 exports.create = (cfg) => {
   // Bound every Upstash call: the queue loop BLPOPs with a server-side
   // timeout, but a dropped connection would otherwise hang fetch() forever
@@ -21,11 +22,11 @@ exports.create = (cfg) => {
   return {
     ping: () => call('PING'),
     next: () => pop('bridge:tasks', cfg.poll_seconds || 25),
-    sendResult: (res) => call('RPUSH', 'bridge:results', JSON.stringify(res)),
+    sendResult: (res) => { let safe = res; try { safe = sanitizeResult(res); } catch {} return call('RPUSH', 'bridge:results', JSON.stringify(safe)); },
     // Status channel for Instinct (queued/running/done/failed). Same
     // Upstash URL + token as tasks/results; new list key only, no new
     // credential or endpoint. Read with BLPOP bridge:status.
-    sendStatus: (event) => call('RPUSH', 'bridge:status', JSON.stringify(event)),
+    sendStatus: (event) => { let safe = event; try { safe = sanitizeObject(event); } catch {} return call('RPUSH', 'bridge:status', JSON.stringify(safe)); },
     push: (task) => call('RPUSH', 'bridge:tasks', JSON.stringify(task)),
     nextResult: (sec = 20) => pop('bridge:results', sec),
   };

@@ -5,6 +5,7 @@ const readline = require('node:readline/promises');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const core = require('../src/core');
+const { sanitizeForHttpResponse } = require('../src/sanitizer.js');
 const CFG = process.env.BRIDGE_CONFIG || 'bridge.config.json';
 const load = () => JSON.parse(fs.readFileSync(CFG, 'utf8'));
 
@@ -47,7 +48,7 @@ async function init() {
     await source.push({ id, secret: cfg.bridge_secret, repo: a, task: b, ...(c ? { session_id: c } : {}) });
     return console.log(id);
   }
-  if (cmd === 'result') return console.log(JSON.stringify(await source.nextResult(Number(a) || 20)) );
+  if (cmd === 'result') return console.log(JSON.stringify(sanitizeForHttpResponse(await source.nextResult(Number(a) || 20))));
   console.log('usage: bridge init | start | push <repo> "<task>" [session_id] | result [secs]');
 })().catch(e => { console.error(e.message); process.exit(1); });
 
