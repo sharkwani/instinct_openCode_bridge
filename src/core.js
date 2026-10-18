@@ -48,6 +48,87 @@ function toSafeOutput(raw) {
 exports.MAX_OUTPUT_CHARS = MAX_OUTPUT_CHARS;
 exports.toSafeOutput = toSafeOutput;
 
+// Persist a patch into the bridge config file (chmod 600, as init writes it).
+// Used by control tasks (e.g. set_model) so a model change survives a restart.
+function persistConfig(configPath, patch) {
+  if (!configPath) return null;
+  const abs = path.resolve(configPath);
+  let cur = {};
+  try { cur = JSON.parse(fs.readFileSync(abs, 'utf8')); } catch {}
+  fs.writeFileSync(abs, JSON.stringify({ ...cur, ...patch }, null, 2) + '\n', { mode: 0o600 });
+  // init writes the config 0600; keep that invariant even when the file already
+  // existed with looser permissions.
+  try { fs.chmodSync(abs, 0o600); } catch {}
+  return abs;
+}
+exports.persistConfig = persistConfig;
+
+// Control tasks (no repo/task): Instinct asks the bridge to change state and
+// gets an ack back over bridge:results + bridge:status, exactly like a task.
+// Supported: set_model (persist + apply) and get_model.
+async function handleControl(cfg, t, opts = {}) {
+  const res = {
+    id: t.id, status: 'done', branch: null, session_id: null, open_command: '',
+    summary: '', output: '', diffstat: '', questions: [], action: t.action || null, model: null,
+  };
+  try {
+    const action = t.action;
+    if (action === 'set_model') {
+      const model = typeof t.model === 'string' ? t.model.trim() : '';
+      if (!model) throw new Error('set_model needs {id, action:"set_model", model:"provider/model"}');
+      if (opts.listModels) {
+        let list = null;
+        try { list = await opts.listModels(); } catch {}
+        if (Array.isArray(list) && list.length) {
+          const known = modelMatchesList(list, model);
+          if (!known) throw new Error(`unknown model "${model}"; use action:"list_models" to list available models`);
+        }
+      }
+      cfg.model = model;
+      const saved = persistConfig(opts.configPath, { model });
+      res.model = model;
+      res.summary = `model set to ${model}${saved ? '' : ' (not persisted: no config path)'}`;
+    } else if (action === 'get_model') {
+      res.model = cfg.model || '';
+      res.summary = cfg.model ? `current model: ${cfg.model}` : 'no model configured (opencode default)';
+    } else if (action === 'list_models' || action === 'get_models') {
+      let list = [];
+      if (opts.listModels) { try { list = (await opts.listModels()) || []; } catch {} }
+      res.models = list
+        .map((m) => (m && m.providerID && m.id ? `${m.providerID}/${m.id}` : ''))
+        .filter(Boolean)
+        .sort()
+        .slice(0, 500);
+      res.summary = `${res.models.length} models available`;
+    } else {
+      res.status = 'error';
+      res.summary = `unknown action "${action}"`;
+    }
+  } catch (e) {
+    res.status = 'error';
+    res.summary = String((e && e.message) || e);
+  }
+  if (!res.output) res.output = toSafeOutput(res.summary || '');
+  return res;
+}
+exports.handleControl = handleControl;
+
+// Match a "provider/model" (optional "#variant") against GET /api/model rows,
+// tolerating the id/modelID field difference across opencode versions.
+function modelMatchesList(list, model) {
+  const raw = String(model).split('#')[0].trim();
+  const slash = raw.indexOf('/');
+  const providerID = slash > 0 ? raw.slice(0, slash) : '';
+  const id = slash > 0 ? raw.slice(slash + 1) : raw;
+  return list.some((m) => {
+    if (!m) return false;
+    if (providerID && m.providerID && m.providerID !== providerID) return false;
+    const candidates = [m.id, m.modelID].map((v) => String(v || '').split('#')[0]);
+    return candidates.includes(id);
+  });
+}
+exports.modelMatchesList = modelMatchesList;
+
 // Bridge secret: task submission (POST /tasks) historically carried it in
 // the JSON/urlencoded body, while result reads (GET /results/:id) required
 // the X-Bridge-Secret header. Instinct sends the same secret the same way
@@ -159,6 +240,7 @@ exports.startHttp = (cfg, opts = {}) => {
   const source = (opts && opts.source) || (_loaded && _loaded.source);
   const statusSend = (opts && opts.statusSend) || (source && typeof source.sendStatus === 'function' ? source.sendStatus.bind(source) : null);
   const resultsFile = (opts && opts.resultsFile) || path.join(__dirname, '..', 'results.jsonl');
+  const configPath = (opts && opts.configPath) || null;
   const listenPort = (opts && opts.port !== undefined) ? opts.port : 8787;
   const listenHost = (opts && opts.host) || '127.0.0.1';
   const results = new Map();
@@ -235,7 +317,7 @@ exports.startHttp = (cfg, opts = {}) => {
       results.set(safe.id, safe);
       try { log('task finished', safe.id, safe.status, 'session', safe.session_id || '(none)', '| open:', safe.open_command || '(no session captured)', safe.summary ? String(sanitizeString(safe.summary)).split('\n')[0].slice(0, 120) : ''); } catch { log('task finished', safe.id, safe.status); }
       try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(safe)) + '\n'); } catch {}
-      status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: safe.status === 'done' || safe.status === 'needs_input' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
+      status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: safe.status === 'done' || safe.status === 'needs_input' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined, questions: safe.questions }));
     }).catch((err) => {
       const summary = String((err && err.message) || err);
       let failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
@@ -244,6 +326,24 @@ exports.startHttp = (cfg, opts = {}) => {
       log('task crashed', t.id, failed.status);
       try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(failed)) + '\n'); } catch {}
       status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary, output: failed.output }));
+    });
+  });
+  // Loopback-only control endpoint (Instinct uses the queue; this is for local
+  // use and tests). Accepts {id, action:"set_model", model:"provider/model"} or
+  // {id, action:"get_model"}.
+  app.post('/control', (req, res) => {
+    const t = req.body || {};
+    if (getReqSecret(req) !== cfg.bridge_secret) return res.status(401).json({ error: 'bad secret' });
+    if (!t.id || !t.action) return res.status(400).json({ error: 'need {id, action}' });
+    log('control from', req.ip, 'id=', t.id, 'action=', t.action);
+    res.json({ id: t.id, status: 'accepted' });
+    const listModels = executor && typeof executor.listModels === 'function' ? () => executor.listModels() : null;
+    serial(() => handleControl(cfg, t, { configPath, listModels })).then((r) => {
+      let safe = r;
+      try { safe = sanitizeResult(r); } catch {}
+      results.set(safe.id, safe);
+      try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(safe)) + '\n'); } catch {}
+      status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, detail: safe.status, summary: safe.summary, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
     });
   });
   app.get('/results/:id', (req, res) => {
@@ -259,32 +359,54 @@ exports.startHttp = (cfg, opts = {}) => {
 // result. Returns the result, or null when nothing was queued. Throws on
 // transport failures so the caller (run) can back off and keep looping
 // forever; one bad task can never wedge later ones.
-async function runOnce(cfg, source, executor) {
+async function runOnce(cfg, source, executor, opts = {}) {
   const t = await source.next();
   if (!t) return null;
   if (t.secret !== cfg.bridge_secret) { log('secret mismatch, rejected', t.id); return null; }
+  const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
+  // Control task: no repo/task work, just mutate bridge state and ack.
+  if (t.action) {
+    log('control', t.action, 'id', t.id);
+    status.notify(statusSend, status.buildEvent('queued', { id: t.id }));
+    const control = await serial(() => handleControl(cfg, t, {
+      configPath: opts.configPath,
+      listModels: executor && typeof executor.listModels === 'function' ? () => executor.listModels() : null,
+    }));
+    let safe = control;
+    try { safe = sanitizeResult(control); } catch {}
+    status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), {
+      id: safe.id,
+      detail: safe.status,
+      summary: terminalEvent(safe.status) === 'done' ? safe.summary : undefined,
+      error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined,
+      output: safe.output || undefined,
+    }));
+    await source.sendResult(safe);
+    log('control result', safe.id, safe.status, safe.summary);
+    return safe;
+  }
   log('pickup task', t.id, t.repo);
   log('task', t.id, t.repo);
-  const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
   status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
   const res = await serial(() => handle(cfg, executor, t, statusSend));
   // Defense-in-depth: handle() already sanitizes; re-sanitize idempotent before publish.
   let safe = res;
   try { safe = sanitizeResult(res); } catch {}
-  status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: terminalEvent(safe.status) === 'done' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
+  const failed = terminalEvent(safe.status) === 'failed';
+  status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: failed ? undefined : safe.summary, error: failed ? safe.summary : undefined, output: safe.output || undefined, questions: safe.questions }));
   await source.sendResult(safe);
   log('result', safe.id, safe.status, 'session', safe.session_id || '(none)', '| open:', safe.open_command || '(no session captured)');
   return safe;
 }
 exports.runOnce = runOnce;
-exports.run = async (cfg) => {
+exports.run = async (cfg, opts = {}) => {
   const { source, executor } = exports.load(cfg);
   log('bridge up; repos:', Object.keys(cfg.repos).join(', '));
-  exports.startHttp(cfg);
+  exports.startHttp(cfg, { configPath: opts.configPath });
   log('ingress started');
   for (;;) {
     try {
-      await runOnce(cfg, source, executor);
+      await runOnce(cfg, source, executor, opts);
     } catch (e) { log('loop error:', e.message); await new Promise(r => setTimeout(r, 5000)); }
   }
 };

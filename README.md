@@ -56,8 +56,23 @@ CLI (see `bin/bridge.js`):
 
 ```sh
 node bin/bridge.js push <repo> "<task>" [session_id]
+node bin/bridge.js model [provider/model]   # omit the arg to print the current model
 node bin/bridge.js result [secs]
 ```
+
+## Changing the model from Instinct
+
+Instinct can switch the model the coding agent runs with by publishing a **control task** to the same queue (no new credential or endpoint):
+
+```json
+{ "id": "c<unique>", "secret": "<bridge_secret>", "action": "set_model", "model": "opencode/deepseek-v4.1-flash-free" }
+```
+
+- The bridge validates the value against the live model list (`GET /api/model`), applies it to the next turn, and **persists it to `bridge.config.json`** so it survives a restart.
+- The ack is published to `bridge:results` (and `bridge:status`): `{ "id": "...", "status": "done", "action": "set_model", "model": "opencode/...", "summary": "model set to ..." }`. An unknown model comes back as `status: "error"` with the reason.
+- `{ "action": "get_model" }` returns the current model.
+- `{ "action": "list_models" }` returns the available `provider/model` strings.
+- Locally, `node bin/bridge.js model opencode/deepseek-v4.1-flash-free` does the same.
 
 ##  Asking Instinct to do work
 
@@ -79,6 +94,8 @@ Instinct submits that task through the bridge queue; your machine picks it up, O
 -  Each task runs on branch `bridge/<task-id>` (sanitized). Tasks run one at a time (serialized in `src/core.js`) so branches and the shared session directory do not race.
 -  Executor contract: `run({task, cwd, sessionId, timeoutMs}) -> {sessionId, summary, questions[]}`.
 -  Result shape: `{id, status, branch, session_id, open_command, summary, diffstat, questions[]}`. `status` is `done`, `needs_input`, `still_running`, or `error`.
+-  `needs_input` (and its `questions[]`) is also carried on the terminal `bridge:status` event, so Instinct can render the question without polling results. When the coding agent asks via an opencode **form**, the bridge relays the form (title + fields) as the question and parks the session: Instinct answers by sending the next task with the **same `session_id`**, and the bridge routes that text through `POST /api/session/:id/form/:formId/reply` before continuing the turn. A question in the final assistant paragraph (a line ending in `?`) is surfaced the same way.
+-  OpenCode failures now include the real error: a failed/interrupted turn carries the structured error (`type: message`) in `summary`/`output`, e.g. `OpenCode turn failed (session ...): provider.no-route: Model unavailable: opencode/x`, instead of a bare outcome.
 -  Wait exhaustion returns `still_running` with the session ID and `open with: opencode --session <id>`, not a bare timeout. Reconnect with a NEW task id plus that `session_id` for multi-turn work.
 -  Local HTTP ingress (`src/core.js`, `127.0.0.1:8787`): `GET /tasks/new` form, `POST /tasks` (secret-gated, rejects duplicate ids), `GET /results`, `POST /results/view`, `GET /results/:id`. Results are appended to `results.jsonl` (local runtime file, git-ignored).
 
@@ -86,7 +103,7 @@ Instinct submits that task through the bridge queue; your machine picks it up, O
 <summary> Executor details</summary>
 
 - `adapters/executor-opencode.js`: runs `opencode run --auto --format json [--session ...] [--model ...]` in `cwd` with an appended branch rule. `--format json` output is parsed defensively for text and session ID.
-- `adapters/executor-opencode-server.js`: uses `opencode serve` on `127.0.0.1:4199` (`POST /api/session`, `POST /api/session/<id>/prompt`, `GET /api/session/<id>/message`). It reuses an already-running server when auth matches. Completion waits for an `idle` message before accepting assistant text. Wait floor is 120 minutes even if `task_timeout_minutes` is smaller; larger `timeoutMs` values are honored.
+- `adapters/executor-opencode-server.js`: uses `opencode serve` on `127.0.0.1:4199` (`POST /api/session`, `POST /api/session/<id>/prompt`, `GET /api/session/<id>/message`). It reuses an already-running server when auth matches. Completion waits for an `idle` message before accepting assistant text. Wait floor is 120 minutes even if `task_timeout_minutes` is smaller; larger `timeoutMs` values are honored. It applies `cfg.model` via `POST /api/session/<id>/model` (and on session create), polls `GET /api/session/<id>/form` to relay questions, and surfaces the structured turn error on failed/interrupted turns. Server startup always sets a password (`openCodeServerPassword` → `OPENCODE_SERVER_PASSWORD` → `bridge_secret` → random) so opencode never self-generates one; a port already held by a server with different credentials fails fast with an actionable message instead of "opencode serve did not come up".
 
 </details>
 
@@ -96,9 +113,9 @@ Instinct submits that task through the bridge queue; your machine picks it up, O
 | Status | Meaning |
 |---|---|
 | `done` | Work produced output. |
-| `needs_input` | Heuristic: the last paragraph contains a line ending in `?`. |
+| `needs_input` | The agent is waiting on you: an opencode form (question) is pending, or the last paragraph contains a line ending in `?`. |
 | `still_running` | Wait exhausted — reconnect with a NEW task id plus the returned `session_id`. |
-| `error` | Something failed (e.g. `HEAD` landed on the wrong branch). |
+| `error` | Something failed (e.g. `HEAD` landed on the wrong branch, or an OpenCode turn failed/interrupted — the structured error is in `summary`/`output`). |
 
 </details>
 

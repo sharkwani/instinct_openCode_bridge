@@ -9,7 +9,7 @@
     "init": "node bin/bridge.js init",
     "start": "node bin/bridge.js start",
     "test:security-public": "node --test test/security-redaction-public.test.js",
-    "test:all": "node --test test/task-output.test.js test/instinct-status.test.js test/security-redaction-public.test.js"
+    "test:all": "node --test test/task-output.test.js test/instinct-status.test.js test/control-and-questions.test.js test/security-redaction-public.test.js"
   },
   "engines": {
     "node": ">=18"
