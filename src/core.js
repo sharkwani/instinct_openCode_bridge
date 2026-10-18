@@ -311,14 +311,21 @@ exports.startHttp = (cfg, opts = {}) => {
     log('accepted task', t.id, t.repo);
     res.json({ id: t.id, status: 'accepted' });
     status.notify(statusSend, status.buildEvent('queued', { id: t.id, sessionId: t.session_id || null }));
-    serial(() => handle(cfg, executor, t, statusSend)).then((r) => {
+    serial(() => handle(cfg, executor, t, statusSend)).then(async (r) => {
       let safe = r;
       try { safe = sanitizeResult(r); } catch {}
       results.set(safe.id, safe);
       try { log('task finished', safe.id, safe.status, 'session', safe.session_id || '(none)', '| open:', safe.open_command || '(no session captured)', safe.summary ? String(sanitizeString(safe.summary)).split('\n')[0].slice(0, 120) : ''); } catch { log('task finished', safe.id, safe.status); }
       try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(safe)) + '\n'); } catch {}
       status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, sessionId: safe.session_id, branch: safe.branch, detail: safe.status, summary: safe.status === 'done' || safe.status === 'needs_input' ? safe.summary : undefined, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined, questions: safe.questions }));
-    }).catch((err) => {
+      // Publish to the same result channel as the queue loop. Tasks can enter
+      // via this local ingress OR via bridge:tasks; Instinct reads the message
+      // back from bridge:results either way. A publish failure must not break
+      // the handler (the result is still persisted to results.jsonl + GET /results/:id).
+      if (source && typeof source.sendResult === 'function') {
+        try { await source.sendResult(safe); } catch (e) { log('ingress result publish failed', safe.id, String((e && e.message) || e).slice(0, 120)); }
+      }
+    }).catch(async (err) => {
       const summary = String((err && err.message) || err);
       let failed = { id: t.id, status: 'error', branch: null, session_id: null, summary, output: toSafeOutput(summary), diffstat: '', questions: [] };
       try { failed = sanitizeResult(failed); } catch {}
@@ -326,6 +333,9 @@ exports.startHttp = (cfg, opts = {}) => {
       log('task crashed', t.id, failed.status);
       try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(failed)) + '\n'); } catch {}
       status.notify(statusSend, status.buildEvent('failed', { id: t.id, sessionId: null, detail: 'error', error: failed.summary, output: failed.output }));
+      if (source && typeof source.sendResult === 'function') {
+        try { await source.sendResult(failed); } catch (e) { log('ingress error publish failed', failed.id, String((e && e.message) || e).slice(0, 120)); }
+      }
     });
   });
   // Loopback-only control endpoint (Instinct uses the queue; this is for local
@@ -338,12 +348,15 @@ exports.startHttp = (cfg, opts = {}) => {
     log('control from', req.ip, 'id=', t.id, 'action=', t.action);
     res.json({ id: t.id, status: 'accepted' });
     const listModels = executor && typeof executor.listModels === 'function' ? () => executor.listModels() : null;
-    serial(() => handleControl(cfg, t, { configPath, listModels })).then((r) => {
+    serial(() => handleControl(cfg, t, { configPath, listModels })).then(async (r) => {
       let safe = r;
       try { safe = sanitizeResult(r); } catch {}
       results.set(safe.id, safe);
       try { fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(safe)) + '\n'); } catch {}
       status.notify(statusSend, status.buildEvent(terminalEvent(safe.status), { id: safe.id, detail: safe.status, summary: safe.summary, error: terminalEvent(safe.status) === 'failed' ? safe.summary : undefined, output: safe.output || undefined }));
+      if (source && typeof source.sendResult === 'function') {
+        try { await source.sendResult(safe); } catch (e) { log('control result publish failed', safe.id, String((e && e.message) || e).slice(0, 120)); }
+      }
     });
   });
   app.get('/results/:id', (req, res) => {
@@ -362,8 +375,20 @@ exports.startHttp = (cfg, opts = {}) => {
 async function runOnce(cfg, source, executor, opts = {}) {
   const t = await source.next();
   if (!t) return null;
-  if (t.secret !== cfg.bridge_secret) { log('secret mismatch, rejected', t.id); return null; }
   const statusSend = source.sendStatus ? source.sendStatus.bind(source) : null;
+  // Reject a task whose secret does not match - but never leave the supervisor
+  // hanging. Report a terminal 'failed' status + error result (keyed by the id
+  // we were given) so a misconfigured secret surfaces instead of a silent void.
+  if (t.secret !== cfg.bridge_secret) {
+    log('secret mismatch, rejected', t.id);
+    if (t.id && typeof source.sendResult === 'function') {
+      let rejected = { id: t.id, status: 'error', branch: null, session_id: t.session_id || null, open_command: '', summary: 'rejected: bad or missing bridge_secret', output: 'rejected: bad or missing bridge_secret', diffstat: '', questions: [] };
+      try { rejected = sanitizeResult(rejected); } catch {}
+      status.notify(statusSend, status.buildEvent('failed', { id: rejected.id, sessionId: rejected.session_id, detail: 'error', error: rejected.summary, output: rejected.output }));
+      await source.sendResult(rejected);
+    }
+    return null;
+  }
   // Control task: no repo/task work, just mutate bridge state and ack.
   if (t.action) {
     log('control', t.action, 'id', t.id);

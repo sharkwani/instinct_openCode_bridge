@@ -25,6 +25,14 @@ function makeTempRepo() {
 }
 const flush = () => new Promise((r) => setTimeout(r, 60));
 
+function waitListening(s) {
+  return new Promise((resolve, reject) => {
+    if (s.listening) return resolve();
+    s.once('listening', resolve);
+    s.once('error', reject);
+  });
+}
+
 describe('model ref parsing and matching', () => {
   it('parses provider/model and optional #variant', () => {
     assert.deepEqual(server.parseModelRef('opencode/deepseek-v4.1-flash-free'),
@@ -218,5 +226,61 @@ describe('control tasks: set_model / get_model', () => {
     assert.ok(posted && posted.id === 'c5');
     await flush();
     assert.ok(statuses.some((e) => e.event === 'done' && e.id === 'c5'));
+  });
+});
+
+describe('ingress publishes results to bridge:results (parity with the queue loop)', () => {
+  it('POST /tasks publishes the finished result via source.sendResult', async () => {
+    const dir = makeTempRepo();
+    const posted = [];
+    const statuses = [];
+    const source = {
+      sendResult: async (r) => { posted.push(r); },
+      sendStatus: async (e) => { statuses.push(e); },
+    };
+    const executor = { async run() { return { summary: 'ok', sessionId: 'ses_ing1', questions: [] }; } };
+    const resultsFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-ing-')), 'results.jsonl');
+    const { server } = core.startHttp(
+      { bridge_secret: 's3cret', repos: { main: dir }, task_timeout_minutes: 30 },
+      { executor, source, resultsFile, port: 0, host: '127.0.0.1' },
+    );
+    await waitListening(server);
+    const base = 'http://127.0.0.1:' + server.address().port;
+    try {
+      const r = await fetch(base + '/tasks', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: 't-ing1', repo: 'main', task: 'do it', secret: 's3cret' }),
+      });
+      assert.equal(r.status, 200);
+      const end = Date.now() + 5000;
+      while (!posted.length && Date.now() < end) await new Promise((x) => setTimeout(x, 50));
+      assert.equal(posted.length, 1, 'ingress result must be published to bridge:results');
+      assert.equal(posted[0].id, 't-ing1');
+      assert.equal(posted[0].status, 'done');
+    } finally {
+      await new Promise((res) => server.close(() => res()));
+      try { execFileSync('git', ['switch', '--detach', 'HEAD'], { cwd: dir }); } catch {}
+    }
+  });
+});
+
+describe('a bad-secret task is rejected without leaving the supervisor hanging', () => {
+  it('publishes a failed status + error result keyed by the given id', async () => {
+    const dir = makeTempRepo();
+    let posted = null;
+    const statuses = [];
+    const source = {
+      next: async () => ({ id: 't-badsecret', repo: 'main', task: 'x', secret: 'wrong' }),
+      sendResult: async (r) => { posted = r; },
+      sendStatus: async (e) => { statuses.push(e); },
+    };
+    const executor = { async run() { throw new Error('executor must not run for a rejected task'); } };
+    const res = await core.runOnce({ bridge_secret: 's3cret', repos: { main: dir } }, source, executor);
+    assert.equal(res, null, 'rejected task is not processed');
+    assert.ok(posted && posted.id === 't-badsecret' && posted.status === 'error');
+    assert.match(posted.summary, /secret/);
+    await flush();
+    assert.ok(statuses.some((e) => e.event === 'failed' && e.id === 't-badsecret'), 'failed status emitted');
   });
 });
