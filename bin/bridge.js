@@ -5,6 +5,7 @@ const readline = require('node:readline/promises');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const core = require('../src/core');
+const { sanitizeForHttpResponse } = require('../src/sanitizer.js');
 const CFG = process.env.BRIDGE_CONFIG || 'bridge.config.json';
 const load = () => JSON.parse(fs.readFileSync(CFG, 'utf8'));
 
@@ -40,14 +41,22 @@ async function init() {
   const [cmd, a, b, c] = process.argv.slice(2);
   if (cmd === 'init') return init();
   const cfg = load();
-  if (cmd === 'start') return core.run(cfg);
+  if (cmd === 'start') return core.run(cfg, { configPath: CFG });
   const { source } = core.load(cfg);
   if (cmd === 'push') {
     const id = 't' + Date.now().toString(36);
     await source.push({ id, secret: cfg.bridge_secret, repo: a, task: b, ...(c ? { session_id: c } : {}) });
     return console.log(id);
   }
-  if (cmd === 'result') return console.log(JSON.stringify(await source.nextResult(Number(a) || 20)) );
-  console.log('usage: bridge init | start | push <repo> "<task>" [session_id] | result [secs]');
+  if (cmd === 'model') {
+    // bridge model            -> print current model
+    // bridge model <p/m>      -> persist a new model (and apply on next turn)
+    if (!a) { console.log(cfg.model || '(opencode default)'); return; }
+    const res = await core.handleControl(cfg, { id: 'c' + Date.now().toString(36), action: 'set_model', model: a }, { configPath: CFG });
+    console.log(JSON.stringify(sanitizeForHttpResponse(res)));
+    return;
+  }
+  if (cmd === 'result') return console.log(JSON.stringify(sanitizeForHttpResponse(await source.nextResult(Number(a) || 20))));
+  console.log('usage: bridge init | start | push <repo> "<task>" [session_id] | model [provider/model] | result [secs]');
 })().catch(e => { console.error(e.message); process.exit(1); });
 

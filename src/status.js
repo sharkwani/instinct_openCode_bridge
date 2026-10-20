@@ -22,9 +22,14 @@ const OUTPUT_TRUNC_SUFFIX = '\n[truncated: output exceeded 12KB]';
 
 // Scrub anything that looks like a credential if it ever leaks into a
 // summary/error string. Conservative: redacts bearer tokens, key=value
-// secrets, and long hex blobs.
+// secrets, and long hex blobs. Plus central registry redaction when loaded
+// (nested/encoded/base64 variants, longest-first). No secret output.
 function scrub(s) {
   let out = String(s || '');
+  try {
+    const { sanitizeString } = require('./sanitizer');
+    out = sanitizeString(out);
+  } catch {}
   out = out.replace(/Bearer\s+[A-Za-z0-9\-._~+/=]+/gi, 'Bearer [redacted]');
   out = out.replace(/(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*\S+/gi, '$1=[redacted]');
   out = out.replace(/\b[0-9a-f]{32,}\b/gi, '[redacted]');
@@ -42,7 +47,15 @@ function safeOutput(s) {
   return out;
 }
 
-function buildEvent(state, { id, sessionId, summary, error, branch, detail, output }) {
+// Questions can be multi-line (a form title plus its fields), so keep newlines
+// and cap per question rather than truncating to the first line.
+function safeQuestion(s) {
+  return scrub(s == null ? '' : String(s)).slice(0, MAX_TEXT);
+}
+
+const MAX_QUESTIONS = 10;
+
+function buildEvent(state, { id, sessionId, summary, error, branch, detail, output, questions }) {
   return {
     event: state, // queued|running|done|failed
     id,
@@ -54,6 +67,11 @@ function buildEvent(state, { id, sessionId, summary, error, branch, detail, outp
     ...(summary ? { summary: safeText(summary) } : {}),
     ...(error ? { error: safeText(error) } : {}),
     ...(output ? { output: safeOutput(output) } : {}),
+    // needs_input: the model is waiting on the user. Instinct reads these to
+    // render the question and answer with a follow-up task on the same session.
+    ...(Array.isArray(questions) && questions.length
+      ? { questions: questions.slice(0, MAX_QUESTIONS).map(safeQuestion).filter(Boolean) }
+      : {}),
   };
 }
 
@@ -81,4 +99,4 @@ function notify(send, event) {
   setImmediate(() => { emit(send, event).catch(() => {}); });
 }
 
-module.exports = { buildEvent, emit, notify, scrub, safeText, safeOutput, MAX_TEXT, MAX_OUTPUT, MAX_ATTEMPTS };
+module.exports = { buildEvent, emit, notify, scrub, safeText, safeOutput, safeQuestion, MAX_TEXT, MAX_OUTPUT, MAX_QUESTIONS, MAX_ATTEMPTS };

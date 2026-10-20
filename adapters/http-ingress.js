@@ -1,8 +1,9 @@
 
 const express = require('express');
 const fs = require('fs');
+const { sanitizeResult, sanitizeForHttpResponse, sanitizeForPersistence } = require('../src/sanitizer.js');
 
-function startHttpIngress({ secret, port, runTask, resultsFile }) {
+function startHttpIngress({ secret, port, runTask, resultsFile, host }) {
   const app = express();
   app.use(express.json());
   const results = new Map();
@@ -10,7 +11,7 @@ function startHttpIngress({ secret, port, runTask, resultsFile }) {
   if (fs.existsSync(resultsFile)) {
     for (const line of fs.readFileSync(resultsFile, 'utf8').split('\n')) {
       if (!line.trim()) continue;
-      try { const r = JSON.parse(line); results.set(r.id, r); } catch {}
+      try { const r = JSON.parse(line); results.set(r.id, sanitizeForHttpResponse(r)); } catch {}
     }
   }
 
@@ -27,23 +28,25 @@ function startHttpIngress({ secret, port, runTask, resultsFile }) {
     res.json({ id, status: 'accepted' });
     try {
       const out = await runTask({ id, repo, prompt });
-      const done = { id, status: 'done', summary: out && out.summary ? out.summary : String(out), diff: out && out.diff };
+      const rawDone = { id, status: 'done', summary: out && out.summary ? out.summary : String(out), diff: out && out.diff };
+      const done = sanitizeResult(rawDone);
       results.set(id, done);
-      fs.appendFileSync(resultsFile, JSON.stringify(done) + '\n');
+      fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(done)) + '\n');
     } catch (err) {
-      const failed = { id, status: 'error', error: String((err && err.message) || err) };
+      const failed = sanitizeResult({ id, status: 'error', error: String((err && err.message) || err) });
       results.set(id, failed);
-      fs.appendFileSync(resultsFile, JSON.stringify(failed) + '\n');
+      fs.appendFileSync(resultsFile, JSON.stringify(sanitizeForPersistence(failed)) + '\n');
     }
   });
 
   app.get('/results/:id', gate, (req, res) => {
     const r = results.get(req.params.id);
     if (!r) return res.status(404).json({ error: 'unknown id' });
-    res.json(r);
+    res.json(sanitizeForHttpResponse(r));
   });
 
-  app.listen(port, '127.0.0.1', () => console.log('http ingress on :' + port));
+  const server = app.listen(port, host || '127.0.0.1', () => console.log('http ingress on :' + server.address().port));
+  return { app, server, results };
 }
 
 module.exports = { startHttpIngress };
